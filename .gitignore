@@ -1,0 +1,27 @@
+# Ignore everything by default
+*
+
+# Allow .gitignore itself
+!.gitignore
+
+# Allow directories
+!*/
+
+# Allow specific folders and their contents
+!scripts/**
+!shopify/**
+!data/**
+
+# Allow specific file types anywhere
+!*.py
+!*.js
+!*.md
+!*.csv
+
+# Explicitly ignore virtual environments and secrets
+venv/
+.env
+
+# Python cache
+__pycache__/
+*.pyc
