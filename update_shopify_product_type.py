@@ -1,141 +1,76 @@
 import os
 import csv
 import time
-import argparse
+import logging
 import requests
 from dotenv import load_dotenv
 from requests.exceptions import RequestException
 
-# ================= CONFIG =================
-CSV_FILE = "generated_product_types.csv"
-REQUEST_DELAY = 0.5     # seconds between requests
-MAX_RETRIES = 3
-# =========================================
+# ---------- SETUP LOGGING ----------
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[logging.StreamHandler()]
+)
 
-# ---------- CLI ----------
-parser = argparse.ArgumentParser()
-parser.add_argument("--dry-run", action="store_true")
-args = parser.parse_args()
-
-# ---------- ENV ----------
 load_dotenv()
 
+CSV_FILE = "generated_product_types.csv"
 STORE_NAME = os.getenv("SHOPIFY_STORE_NAME")
 ACCESS_TOKEN = os.getenv("SHOPIFY_ACCESS_TOKEN")
-API_VERSION = os.getenv("API_VERSION")
-
-DRY_RUN = args.dry_run or os.getenv("DRY_RUN", "false").lower() == "true"
+API_VERSION = os.getenv("API_VERSION", "2024-01")
+DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
 
 BASE_URL = f"https://{STORE_NAME}.myshopify.com/admin/api/{API_VERSION}"
-HEADERS = {
+
+# ---------- PERSISTENT SESSION ----------
+session = requests.Session()
+session.headers.update({
     "X-Shopify-Access-Token": ACCESS_TOKEN,
     "Content-Type": "application/json"
-}
+})
 
-# ------------------------------------------------
-
-def safe_get(url, params=None):
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            r = requests.get(url, headers=HEADERS, params=params, timeout=15)
-            r.raise_for_status()
-            return r
-        except RequestException as e:
-            print(f"⚠️ GET failed (attempt {attempt}): {e}")
-            time.sleep(attempt * 2)
-    return None
-
-def safe_put(url, payload):
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            r = requests.put(url, headers=HEADERS, json=payload, timeout=15)
-            r.raise_for_status()
-            return r
-        except RequestException as e:
-            print(f"⚠️ PUT failed (attempt {attempt}): {e}")
-            time.sleep(attempt * 2)
-    return None
-
-# ------------------------------------------------
-
-def find_variant_by_sku(sku):
-    url = f"{BASE_URL}/variants.json"
-    r = safe_get(url, params={"sku": sku})
-    if not r:
-        return None, None
-
-    variants = r.json().get("variants", [])
-    if not variants:
-        return None, None
-
-    v = variants[0]
-    return v["id"], v["product_id"]
-
-def update_product_type(product_id, product_type):
-    url = f"{BASE_URL}/products/{product_id}.json"
-
-    payload = {
-        "product": {
-            "id": product_id,
-            "product_type": product_type
-        }
-    }
-
+def update_product_type(product_id, new_type):
     if DRY_RUN:
-        print(f"[DRY RUN] Would update product {product_id} → {product_type}")
+        logging.info(f"[DRY RUN] Would update {product_id} -> {new_type}")
         return True
 
-    r = safe_put(url, payload)
-    if r:
-        print(f"✅ Updated product {product_id} → {product_type}")
+    url = f"{BASE_URL}/products/{product_id}.json"
+    payload = {"product": {"id": product_id, "product_type": new_type}}
+    
+    try:
+        r = session.put(url, json=payload, timeout=15)
+        if r.status_code == 429:
+            wait = int(r.headers.get("Retry-After", 2))
+            logging.warning(f"Rate limited. Waiting {wait}s...")
+            time.sleep(wait)
+            return update_product_type(product_id, new_type)
+        
+        r.raise_for_status()
+        logging.info(f"SUCCESS: Product {product_id} updated to '{new_type}'")
         return True
+    except Exception as e:
+        logging.error(f"FAILED: Product {product_id}: {e}")
+        return False
 
-    print(f"❌ Failed updating product {product_id}")
-    return False
+def main():
+    if not os.path.exists(CSV_FILE):
+        logging.error(f"CSV file {CSV_FILE} not found!")
+        return
 
-# ------------------------------------------------
+    success_count = 0
+    with open(CSV_FILE, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            p_id = row.get("Product_ID")
+            p_type = row.get("Generated_Product_Type")
 
-print("\n========== SHOPIFY PRODUCT TYPE UPDATE ==========")
-print("CSV:", CSV_FILE)
-print("DRY_RUN:", DRY_RUN)
-print("=================================================")
+            if p_id and p_type:
+                if update_product_type(p_id, p_type):
+                    success_count += 1
+                time.sleep(0.1) # Small delay to be polite
 
-updated_products = set()
-skipped = 0
-failed = 0
+    logging.info(f"Done. Total Products Updated: {success_count}")
 
-with open(CSV_FILE, newline="", encoding="utf-8") as f:
-    reader = csv.DictReader(f)
-
-    for row in reader:
-        sku = row["SKU"].strip()
-        product_type = row["Generated_Product_Type"].strip()
-
-        print("\n---------------------------------")
-        print("SKU:", sku)
-        print("Product Type:", product_type)
-
-        variant_id, product_id = find_variant_by_sku(sku)
-
-        if not product_id:
-            print("⛔ SKU not found — skipped")
-            skipped += 1
-            continue
-
-        if product_id in updated_products:
-            print("↪ Product already updated — skipped")
-            continue
-
-        success = update_product_type(product_id, product_type)
-        if success:
-            updated_products.add(product_id)
-        else:
-            failed += 1
-
-        time.sleep(REQUEST_DELAY)
-
-print("\n=================================================")
-print("TOTAL PRODUCTS UPDATED:", len(updated_products))
-print("SKIPPED:", skipped)
-print("FAILED:", failed)
-print("=================================================")
+if __name__ == "__main__":
+    main()
