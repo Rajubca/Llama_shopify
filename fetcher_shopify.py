@@ -17,8 +17,6 @@ MODE =  "COLLECTION"
 COLLECTION_HANDLE = "parasol"  # required only if MODE = "COLLECTION"
 COLLECTION_HANDLE = "garden-outdoors"  # required only if MODE = "COLLECTION"
 
-# Canonical product types mapping
-CANONICAL_CACHE = {}
 
 # ===============================================
 
@@ -65,15 +63,17 @@ def caption_image(image_url, max_retries=3):
 
 def generate_product_type(caption):
     prompt = f"""
-Generate a generic product type name from the image description below.
+Identify the main product shown in the image description below.
 
-Strict rules:
-- Use 2 to 4 words only
-- Use singular noun form
-- No colors
-- No brand names
-- No marketing adjectives
+Rules:
+- Use 1 to 3 words only
+- Use a singular noun
+- No color
+- No size
+- No brand
+- No adjectives
 - No punctuation
+- No explanation
 
 Image description:
 "{caption}"
@@ -88,7 +88,9 @@ Return only the product type.
         stderr=subprocess.PIPE
     )
 
-    return result.stdout.decode("utf-8", errors="ignore").strip()
+    return normalize_product_type(
+        result.stdout.decode("utf-8", errors="ignore").strip()
+    )
 
 def fetch_products_all():
     products = []
@@ -154,8 +156,9 @@ def extract_color(caption):
 Identify the main visible color of the product in the image.
 
 Rules:
-- Mention the color plainly
-- Avoid explanations if possible
+- Mention ONE color only
+- Return empty if unclear
+- No explanation
 
 Image description:
 "{caption}"
@@ -167,36 +170,18 @@ Image description:
         stderr=subprocess.PIPE
     )
 
-    raw = result.stdout.decode("utf-8", errors="ignore").strip().lower()
+    raw = result.stdout.decode("utf-8", errors="ignore").lower()
 
-    # --- CLEANING STEP (THIS IS THE KEY FIX) ---
-    # Extract first reasonable color word from the response
     match = re.search(
-        r"\b(black|white|grey|gray|beige|tan|brown|blue|green|red|pink)\b",
+        r"\b(black|white|grey|gray|beige|tan|brown|blue|green|red|pink|yellow|orange)\b",
         raw
     )
 
     if match:
-        return match.group(1)
+        return match.group(1).title()
 
-    # Fallback: take first word only (last safety net)
-    return raw.split()[0] if raw else "black"
+    return ""   # ← STRICT: no color if unclear
 
-def extract_size_from_title(title):
-    patterns = [
-        r"\d+\s?kg",           # 12kg, 35 kg
-        r"\d+(\.\d+)?m",       # 3m, 3.5m
-        r"\d+x\d+m",           # 3x3m
-        r"\d+x\d+x\d+cm",      # 103.5x103.5x7.5CM
-        r"\d+mm",              # 38mm
-    ]
-
-    for p in patterns:
-        match = re.search(p, title.lower())
-        if match:
-            return match.group().upper()
-
-    return ""
 
 def normalize_product_type(text):
     text = text.lower()
@@ -221,62 +206,6 @@ def normalize_product_type(text):
 
     return text
 
-def get_canonical_product_type(base_type):
-    """
-    Convert a cleaned product type into a short, standard ecommerce category.
-    Uses Ollama + cache to ensure stability.
-    """
-
-    key = base_type.lower()
-
-    # 1️⃣ Cache hit (VERY IMPORTANT)
-    if key in CANONICAL_CACHE:
-        return CANONICAL_CACHE[key]
-
-    prompt = f"""
-Convert the following product type into a standard ecommerce category.
-
-Rules:
-- Use 1 to 3 words
-- Use singular noun
-- No color
-- No size
-- No brand
-- No explanation
-- Common retail category wording only
-
-Input:
-"{base_type}"
-
-Return only the category name.
-"""
-
-    result = subprocess.run(
-        ["ollama", "run", "mistral"],
-        input=prompt.encode("utf-8"),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE
-    )
-
-    canonical = result.stdout.decode("utf-8", errors="ignore").strip()
-
-    # Safety cleanup
-    canonical = normalize_product_type(canonical)
-
-    # 2️⃣ Cache store
-    CANONICAL_CACHE[key] = canonical
-
-    return canonical
-
-def save_cache():
-    with open("canonical_cache.json", "w") as f:
-        json.dump(CANONICAL_CACHE, f, indent=2)
-
-def load_cache():
-    global CANONICAL_CACHE
-    if os.path.exists("canonical_cache.json"):
-        with open("canonical_cache.json") as f:
-            CANONICAL_CACHE = json.load(f)
             
 # ================= MAIN =================
 
@@ -287,9 +216,6 @@ print("STORE_URL:", STORE_URL)
 print("API_VERSION:", API_VERSION)
 print("DRY_RUN:", DRY_RUN)
 print("===========================")
-
-#load canonical cache
-load_cache()
 
 # Fetch products
 if MODE == "COLLECTION":
@@ -323,25 +249,19 @@ for idx, product in enumerate(products, start=1):
 
     print("Caption:", caption)
 
-    # -------- UNIVERSAL LOGIC --------
-    raw_type = generate_product_type(caption)
-    clean_type = normalize_product_type(raw_type)
-    base_type = get_canonical_product_type(clean_type)
 
-
+    # -------- FINAL IMAGE-ONLY LOGIC --------
+    base_type = generate_product_type(caption)
     color = extract_color(caption)
-    size = extract_size_from_title(product["title"])
 
     parts = [base_type]
 
     if color:
-        parts.append(color.title())
-
-    if size:
-        parts.append(size)
+        parts.append(color)
 
     product_type = " ".join(parts)
-    # ---------------------------------
+    # ---------------------------------------
+
 
     print("Final Product Type:", product_type)
 
@@ -363,8 +283,7 @@ for idx, product in enumerate(products, start=1):
         })
 
         print("  ✅ ROW ADDED | SKU:", sku)
-# Save cache after processing
-save_cache()
+
 print("\n===========================")
 print("TOTAL ROWS:", len(rows))
 print("===========================")
